@@ -131,10 +131,12 @@ model node decides which input list is offered (any required input ending
 in `_name`, e.g. `ckpt_name` or `unet_name`), falling back to
 `CheckpointLoaderSimple.ckpt_name` — the same approach Open-WebUI uses.
 
-The `generate_image` tool reports a short textual result when the image
-is ready (in addition to the widget shown in the chat), so the assistant
-always closes the turn and the stop button clears reliably once the
-image is done.
+The `generate_image` tool always releases its result with a short
+textual report — success or failure — in addition to the widget shown in
+the chat. Newelle 1.5's built-in image tool never releases its result,
+which blocks the generation chain and leaves the chat's stop button
+visible after the image is done; the report also lets the assistant
+close the turn properly and tell you when a generation fails.
 
 ## Development
 

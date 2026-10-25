@@ -131,6 +131,12 @@ class ComfyUIHandler(ImageGeneratorHandler):
 
     def __init__(self, settings, path):
         super().__init__(settings, path)
+        # Outcome of the last generate_image call per msg_uuid. Newelle
+        # 1.5's generate_and_display has no error callback (errors are
+        # only printed and on_done_callback fires regardless), so the
+        # tool reads the outcome from here to report success or failure.
+        self._generation_errors = {}
+        self._generation_error_lock = threading.Lock()
         self.models = ()
         cached = self.get_setting("models", False)
         if cached:
@@ -1182,8 +1188,20 @@ class ComfyUIHandler(ImageGeneratorHandler):
         """Generate an image with ComfyUI and return the local file path.
 
         Runs on a worker thread through the base class, so no GTK calls
-        happen here.
+        happen here. The outcome is tracked per ``msg_uuid`` so the
+        ``generate_image`` tool can report success or failure.
         """
+        try:
+            path = self._generate_image_impl(prompt, msg_uuid, output_file)
+        except Exception as error:
+            with self._generation_error_lock:
+                self._generation_errors[msg_uuid] = str(error)
+            raise
+        with self._generation_error_lock:
+            self._generation_errors.pop(msg_uuid, None)
+        return path
+
+    def _generate_image_impl(self, prompt: str, msg_uuid: str, output_file: str | None) -> str:
         if output_file is None:
             output_file = self.cache_path_for(msg_uuid)
 
@@ -1216,14 +1234,18 @@ class ComfyUIHandler(ImageGeneratorHandler):
     # ------------------------------------------------------------------
 
     def _generate_image_tool(self, prompt: str, msg_uuid=None):
-        """Like the base class tool, but with a textual result on success.
+        """Like the base class tool, but the result always carries an output.
 
-        A widget-only ToolResult (output ``None``) ends the generation
-        without a follow-up model turn, and on some Newelle versions that
-        leaves the chat's stop button visible after the image is done.
-        Returning a short text makes the assistant close the turn through
-        the same path every other tool uses; the image itself is shown
-        through the widget.
+        Newelle 1.5's default image tool never releases its ToolResult,
+        so the generation chain blocks forever and the chat's stop button
+        stays after the image is done. This tool releases the result
+        with a short textual report instead, which makes the assistant
+        close the turn through the same path every other tool uses; the
+        image itself is shown through the widget.
+
+        The base class worker only provides ``on_done_callback`` (it
+        fires on success and failure alike; errors are just printed), so
+        the outcome recorded by ``generate_image`` decides the report.
         """
         from .tools import ToolResult
         from .ui.widgets.image_generator import ImageGeneratorWidget
@@ -1232,32 +1254,28 @@ class ComfyUIHandler(ImageGeneratorHandler):
         widget.set_prompt(prompt)
         result = ToolResult()
         result.set_widget(widget)
-        failed = {"value": False}
-
-        def on_error(message):
-            failed["value"] = True
-            result.set_output(
-                _("Image generation failed: {message}").format(message=message)
-            )
 
         def on_done():
-            if not failed["value"]:
+            with self._generation_error_lock:
+                error = self._generation_errors.pop(msg_uuid, None)
+            if error is not None:
+                result.set_output(
+                    _("Image generation failed: {message}").format(message=error)
+                )
+            else:
                 result.set_output(
                     _("The image was generated successfully and is displayed above.")
                 )
 
-        self.generate_and_display(
-            prompt,
-            widget,
-            msg_uuid,
-            on_done_callback=on_done,
-            on_error_callback=on_error,
-        )
+        self.generate_and_display(prompt, widget, msg_uuid, on_done_callback=on_done)
         return result
 
     def get_tools(self) -> list:
         tools = super().get_tools()
-        # Swap the tool function so the result always carries an output.
+        # The base class builds the Tool with self._generate_image_tool,
+        # which already resolves to the override above through normal
+        # attribute lookup. Swap it explicitly anyway so the tool keeps
+        # carrying a result if a future base version binds differently.
         for tool in tools:
             if tool.name == "generate_image":
                 tool.func = self._generate_image_tool

@@ -182,16 +182,21 @@ class _FakeHandlerBase:
         return [_FakeTool("generate_image", self._generate_image_tool)]
 
     def generate_and_display(self, prompt, widget, msg_uuid,
-                             on_done_callback=None, on_error_callback=None):
-        """Synchronous stand-in for the base class worker flow."""
+                             on_done_callback=None):
+        """Stand-in mirroring Newelle 1.5's worker flow.
+
+        The real base class swallows generation errors (it only prints
+        them), has no on_error_callback parameter, and invokes
+        on_done_callback on success and failure alike. The worker thread
+        is omitted here to keep the tests deterministic.
+        """
+        output_path = self.cache_path_for(msg_uuid)
         try:
-            path = self.generate_image(prompt, msg_uuid)
-            if not path:
-                raise RuntimeError("The image provider returned no image.")
-        except Exception as error:  # noqa: BLE001 - report any failure
-            if on_error_callback:
-                on_error_callback(str(error))
-            return
+            image_source = self.generate_image(prompt, msg_uuid, output_file=output_path)
+            if not image_source:
+                print("Image generation failed: no image returned")
+        except Exception as error:  # noqa: BLE001 - the base swallows errors too
+            print(f"Image generation failed: {error}")
         if on_done_callback:
             on_done_callback()
 
@@ -938,10 +943,10 @@ class ComfyUIExtensionTests(unittest.TestCase):
     def test_tool_reports_text_output(self):
         """The image tool releases its ToolResult with a textual output.
 
-        A widget-only result (output None) ends the generation without a
-        follow-up model turn, a path that can leave the chat's stop
-        button visible after the image is done. A textual output closes
-        the turn like every other tool, and the widget is still shown.
+        Newelle 1.5's default image tool never releases its result, which
+        blocks the generation chain and leaves the chat's stop button
+        visible after the image is done. A textual output closes the
+        turn like every other tool, and the widget is still shown.
         """
         handler = self.make_handler()
         tools = handler.get_tools()
@@ -952,9 +957,15 @@ class ComfyUIExtensionTests(unittest.TestCase):
         output = result.get_output()  # must not block
         self.assertIn("generated successfully", str(output))
         self.assertIsNotNone(result.widget)
+        self.assertEqual(handler._generation_errors, {})
 
     def test_tool_reports_error_output(self):
-        """Generation failures release the result with an error output."""
+        """Generation failures release the result with an error output.
+
+        Newelle 1.5's worker only ever calls on_done_callback (errors are
+        printed, not passed on), so the outcome recorded by
+        generate_image decides what the tool reports.
+        """
         handler = self.make_handler({"url": f"http://127.0.0.1:{free_port()}"})
         tools = handler.get_tools()
         tool = next(item for item in tools if item.name == "generate_image")
@@ -962,6 +973,21 @@ class ComfyUIExtensionTests(unittest.TestCase):
         output = result.get_output()  # must not block
         self.assertIn("Image generation failed", str(output))
         self.assertIsNotNone(result.widget)
+        self.assertEqual(handler._generation_errors, {})
+
+    def test_generate_image_tracks_outcome_per_message(self):
+        """generate_image records the failure and clears it on success."""
+        handler = self.make_handler({"url": f"http://127.0.0.1:{free_port()}"})
+        with self.assertRaises(RuntimeError):
+            handler.generate_image("a cat", "msg-3")
+        with handler._generation_error_lock:
+            self.assertIn("msg-3", handler._generation_errors)
+
+        working = self.make_handler()
+        path = working.generate_image("a cat", "msg-4")
+        self.assertTrue(os.path.exists(path))
+        with working._generation_error_lock:
+            self.assertEqual(working._generation_errors, {})
 
     def test_unknown_node_raises(self):
         handler = self.make_handler(
