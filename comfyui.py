@@ -1211,6 +1211,58 @@ class ComfyUIHandler(ImageGeneratorHandler):
             self._download_image(image, target)
         return output_file
 
+    # ------------------------------------------------------------------
+    # Tool
+    # ------------------------------------------------------------------
+
+    def _generate_image_tool(self, prompt: str, msg_uuid=None):
+        """Like the base class tool, but with a textual result on success.
+
+        A widget-only ToolResult (output ``None``) ends the generation
+        without a follow-up model turn, and on some Newelle versions that
+        leaves the chat's stop button visible after the image is done.
+        Returning a short text makes the assistant close the turn through
+        the same path every other tool uses; the image itself is shown
+        through the widget.
+        """
+        from .tools import ToolResult
+        from .ui.widgets.image_generator import ImageGeneratorWidget
+
+        widget = ImageGeneratorWidget(width=400, height=400)
+        widget.set_prompt(prompt)
+        result = ToolResult()
+        result.set_widget(widget)
+        failed = {"value": False}
+
+        def on_error(message):
+            failed["value"] = True
+            result.set_output(
+                _("Image generation failed: {message}").format(message=message)
+            )
+
+        def on_done():
+            if not failed["value"]:
+                result.set_output(
+                    _("The image was generated successfully and is displayed above.")
+                )
+
+        self.generate_and_display(
+            prompt,
+            widget,
+            msg_uuid,
+            on_done_callback=on_done,
+            on_error_callback=on_error,
+        )
+        return result
+
+    def get_tools(self) -> list:
+        tools = super().get_tools()
+        # Swap the tool function so the result always carries an output.
+        for tool in tools:
+            if tool.name == "generate_image":
+                tool.func = self._generate_image_tool
+        return tools
+
 
 class ComfyUIExtension(NewelleExtension):
     """Registers the ComfyUI image generator with Newelle."""

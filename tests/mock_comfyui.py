@@ -178,6 +178,23 @@ class _FakeHandlerBase:
     def cache_path_for(self, msg_uuid):
         return os.path.join(self.cache_dir, f"{msg_uuid}.png")
 
+    def get_tools(self):
+        return [_FakeTool("generate_image", self._generate_image_tool)]
+
+    def generate_and_display(self, prompt, widget, msg_uuid,
+                             on_done_callback=None, on_error_callback=None):
+        """Synchronous stand-in for the base class worker flow."""
+        try:
+            path = self.generate_image(prompt, msg_uuid)
+            if not path:
+                raise RuntimeError("The image provider returned no image.")
+        except Exception as error:  # noqa: BLE001 - report any failure
+            if on_error_callback:
+                on_error_callback(str(error))
+            return
+        if on_done_callback:
+            on_done_callback()
+
 
 class _FakeNewelleExtension:
     id = "demoextension"
@@ -193,6 +210,70 @@ class _FakeNewelleExtension:
         return []
 
 
+class _FakeTool:
+    """Minimal stand-in for Newelle's Tool."""
+
+    def __init__(self, name, func, restore_func=None, default_on=False):
+        self.name = name
+        self.func = func
+        self.restore_func = restore_func
+        self.default_on = default_on
+
+
+class _FakeToolResult:
+    """Semaphore-faithful copy of Newelle's ToolResult."""
+
+    def __init__(self, output=None, widget=None, requires_interaction=False,
+                 interaction_options=None, display_text=None, context_messages=None,
+                 stop_generation=False, cancel_callback=None):
+        import threading
+
+        self.output = output
+        self.widget = widget
+        self.display_text = display_text
+        self.context_messages = list(context_messages or [])
+        self.stop_generation = bool(stop_generation)
+        self.cancel_callback = cancel_callback
+        self.is_cancelled = False
+        self.requires_interaction = requires_interaction
+        self.interaction_options = interaction_options or []
+        self.output_semaphore = threading.Semaphore()
+        self.output_semaphore.acquire()
+
+    def get_output(self):
+        self.output_semaphore.acquire()
+        self.output_semaphore.release()
+        return self.output
+
+    def set_output(self, output):
+        self.output = output
+        try:
+            self.output_semaphore.release()
+        except ValueError:
+            # Semaphore already released
+            pass
+
+    def set_widget(self, widget):
+        self.widget = widget
+
+    def get_context_messages(self):
+        return list(self.context_messages)
+
+    def cancel(self):
+        self.is_cancelled = True
+        self.set_output(None)
+
+
+class _FakeImageGeneratorWidget:
+    def __init__(self, width=400, height=400):
+        self.width = width
+        self.height = height
+        self.prompt = None
+
+    def set_prompt(self, prompt):
+        self.prompt = prompt
+
+
 def load_extension_module():
     """Import comfyui.py as ``newelle.comfyui`` with the fakes installed."""
     if "newelle.comfyui" in sys.modules:
@@ -206,13 +287,28 @@ def load_extension_module():
     handlers.HandlerDescription = _HandlerDescription
     handlers.ImageGeneratorHandler = _FakeHandlerBase
 
+    tools_mod = types.ModuleType("newelle.tools")
+    tools_mod.Tool = _FakeTool
+    tools_mod.ToolResult = _FakeToolResult
+
+    ui_mod = types.ModuleType("newelle.ui")
+    widgets_mod = types.ModuleType("newelle.ui.widgets")
+    image_gen_mod = types.ModuleType("newelle.ui.widgets.image_generator")
+    image_gen_mod.ImageGeneratorWidget = _FakeImageGeneratorWidget
+
     extensions = types.ModuleType("newelle.extensions")
     extensions.NewelleExtension = _FakeNewelleExtension
 
     sys.modules["newelle"] = newelle
     sys.modules["newelle.handlers"] = handlers
+    sys.modules["newelle.tools"] = tools_mod
+    sys.modules["newelle.ui"] = ui_mod
+    sys.modules["newelle.ui.widgets"] = widgets_mod
+    sys.modules["newelle.ui.widgets.image_generator"] = image_gen_mod
     sys.modules["newelle.extensions"] = extensions
     newelle.handlers = handlers
+    newelle.tools = tools_mod
+    newelle.ui = ui_mod
     newelle.extensions = extensions
 
     if "gi.repository" not in sys.modules:
@@ -838,6 +934,34 @@ class ComfyUIExtensionTests(unittest.TestCase):
             self.assertIn("disappeared", str(context.exception))
         finally:
             server.stop()
+
+    def test_tool_reports_text_output(self):
+        """The image tool releases its ToolResult with a textual output.
+
+        A widget-only result (output None) ends the generation without a
+        follow-up model turn, a path that can leave the chat's stop
+        button visible after the image is done. A textual output closes
+        the turn like every other tool, and the widget is still shown.
+        """
+        handler = self.make_handler()
+        tools = handler.get_tools()
+        tool = next(item for item in tools if item.name == "generate_image")
+        self.assertIs(tool.func.__func__, handler._generate_image_tool.__func__)
+
+        result = tool.func("a cat", "msg-1")
+        output = result.get_output()  # must not block
+        self.assertIn("generated successfully", str(output))
+        self.assertIsNotNone(result.widget)
+
+    def test_tool_reports_error_output(self):
+        """Generation failures release the result with an error output."""
+        handler = self.make_handler({"url": f"http://127.0.0.1:{free_port()}"})
+        tools = handler.get_tools()
+        tool = next(item for item in tools if item.name == "generate_image")
+        result = tool.func("a cat", "msg-2")
+        output = result.get_output()  # must not block
+        self.assertIn("Image generation failed", str(output))
+        self.assertIsNotNone(result.widget)
 
     def test_unknown_node_raises(self):
         handler = self.make_handler(

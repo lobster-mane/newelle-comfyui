@@ -131,6 +131,11 @@ model node decides which input list is offered (any required input ending
 in `_name`, e.g. `ckpt_name` or `unet_name`), falling back to
 `CheckpointLoaderSimple.ckpt_name` — the same approach Open-WebUI uses.
 
+The `generate_image` tool reports a short textual result when the image
+is ready (in addition to the widget shown in the chat), so the assistant
+always closes the turn and the stop button clears reliably once the
+image is done.
+
 ## Development
 
 The development environment is NixOS; enter the shell with:
